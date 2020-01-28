@@ -128,7 +128,7 @@ class Solver(BaseSolver):
                     b, t, _ = att_output.shape
                     att_output = fuse_output if self.emb_fuse else att_output
                     att_loss = self.seq_loss(
-                        att_output.view(b*t, -1), txt.view(-1))
+                        att_output.contiguous().view(b*t, -1), txt.contiguous().view(-1))
                     total_loss += att_loss*(1-self.model.ctc_weight)
 
                 self.timer.cnt('fw')

@@ -47,6 +47,14 @@ def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
+def make_mask_from_lens(x, lens):
+    if lens is None:
+        return None
+    mask = torch.zeros(x.shape[:2])
+    for i, j in enumerate(lens):
+        mask[i,:j] = 1
+    return mask.unsqueeze(-1)
+
 class Encoder(nn.Module):
     "Core encoder is a stack of N layers"
     def __init__(self, layer, N):
@@ -70,8 +78,9 @@ class TransformerEncoder(nn.Module):
         self.encoder = encoder
         self.src_embed = src_embed # Embedding function
     
-    def forward(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+    def forward(self, src, src_lens):
+        src_mask = make_mask_from_lens(src, src_lens)
+        return self.encoder(self.src_embed(src), src_mask), src_lens
 
 
 class LayerNorm(nn.Module):
@@ -92,14 +101,19 @@ class SublayerConnection(nn.Module):
     A residual connection followed by a layer norm.
     Note for code simplicity the norm is first as opposed to last.
     """
-    def __init__(self, size, dropout):
+    def __init__(self, size, dropout, first_only=False):
         super(SublayerConnection, self).__init__()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
+        self.first_only = first_only
 
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
-        return x + self.dropout(sublayer(self.norm(x)))
+        if self.first_only:
+            w, others = sublayer(self.norm(x))
+            return x + self.dropout(w), others
+        else:
+            return x + self.dropout(sublayer(self.norm(x)))
 
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward (defined below)"
@@ -112,7 +126,7 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x, mask):
         "Follow Figure 1 (left) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask)[0])
         return self.sublayer[1](x, self.feed_forward)
 
 class Decoder(nn.Module):
@@ -122,10 +136,15 @@ class Decoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
         
-    def forward(self, x, memory, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
+    def forward(self, x, memory, src_mask, tgt_mask, past=None):
+        if past is None:
+            past = [None] * len(self.layers)
+        
+        new_past = []
+        for layer, layer_past in zip(self.layers, past):
+            x, new_layer_past = layer(x, memory, src_mask, tgt_mask, layer_past)
+            new_past.append(new_layer_past)
+        return self.norm(x), new_past
 
 class TransformerDecoder(nn.Module):
     """
@@ -137,8 +156,9 @@ class TransformerDecoder(nn.Module):
         self.decoder = decoder
         self.tgt_embed = tgt_embed  # Embedding function
         
-    def forward(self, memory, src_mask, tgt, tgt_mask):
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+    def forward(self, memory, src_lens, tgt, tgt_mask, past=None):
+        src_mask = make_mask_from_lens(memory, src_lens)
+        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask, past)
 
 
 class DecoderLayer(nn.Module):
@@ -149,20 +169,30 @@ class DecoderLayer(nn.Module):
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+        self.sublayer = nn.ModuleList([SublayerConnection(size, dropout, first_only=True),
+                                       SublayerConnection(size, dropout, first_only=False),
+                                       SublayerConnection(size, dropout, first_only=False)])
  
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x, memory, src_mask, tgt_mask, past=None):
         "Follow Figure 1 (right) for connections."
         m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
-        return self.sublayer[2](x, self.feed_forward)
+        x, past = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask, past))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask.transpose(-2, -1))[0])
+        return self.sublayer[2](x, self.feed_forward), past
 
 def subsequent_mask(size):
     "Mask out subsequent positions."
     attn_shape = (1, size, size)
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     return torch.from_numpy(subsequent_mask) == 0
+
+def make_std_mask(tgt, pad):
+    "Create a mask to hide padding and future words."
+    first_col = torch.zeros_like(tgt)
+    first_col[:, 0] = 1
+    tgt_mask = ((tgt != pad) | first_col.bool()).unsqueeze(-2)
+    tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)
+    return tgt_mask
 
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
@@ -188,7 +218,7 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
         
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, past=None):
         "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all h heads.
@@ -199,6 +229,15 @@ class MultiHeadedAttention(nn.Module):
         query, key, value = \
             [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
+
+        if past is not None:
+            assert mask is None, "Using past state while auto-regressive decoding without mask."
+            past_key, past_value = past
+            key = torch.cat((past_key, key), dim=-2)
+            value = torch.cat((past_value, value), dim=-2)
+            temp_past = key, value
+        else:
+            temp_past = None
         
         # 2) Apply attention on all the projected vectors in batch. 
         x, self.attn = attention(query, key, value, mask=mask.to(query.device) if type(mask)!=type(None) else mask, 
@@ -207,7 +246,7 @@ class MultiHeadedAttention(nn.Module):
         # 3) "Concat" using a view and apply a final linear. 
         x = x.transpose(1, 2).contiguous() \
              .view(nbatches, -1, self.h * self.d_k)
-        return self.linears[-1](x)
+        return self.linears[-1](x), temp_past
 
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."

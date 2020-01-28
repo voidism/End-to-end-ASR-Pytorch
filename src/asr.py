@@ -7,7 +7,7 @@ from torch.distributions.categorical import Categorical
 
 from src.util import init_weights, init_gate
 from src.module import VGGExtractor, CNNExtractor, RNNLayer, ScaleDotAttention, LocationAwareAttention
-
+from src.transformer import SpeechTransformerEncoder, SpeechTransformerDecoder, make_std_mask
 
 class ASR(nn.Module):
     ''' ASR model, including Encoder/Decoder(s)'''
@@ -32,22 +32,26 @@ class ASR(nn.Module):
             self.pre_embed = nn.Embedding(vocab_size, self.dec_dim)
             self.embed_drop = nn.Dropout(emb_drop)
             self.decoder = Decoder(
-                self.encoder.out_dim+self.dec_dim, vocab_size, **decoder)
-            query_dim = self.dec_dim*self.decoder.layer
-            self.attention = Attention(
-                self.encoder.out_dim, query_dim, **attention)
+                self.encoder.out_dim + self.dec_dim, vocab_size, **decoder)
+            if self.decoder.decoder_type == 'rnn':
+                query_dim = self.dec_dim*self.decoder.layer
+                self.attention = Attention(
+                    self.encoder.out_dim, query_dim, **attention)
+            else:
+                self.attention = None
 
         # Init
-        if init_adadelta:
+        if init_adadelta and self.decoder.decoder_type == 'rnn':
             self.apply(init_weights)
             for l in range(self.decoder.layer):
                 bias = getattr(self.decoder.layers, 'bias_ih_l{}'.format(l))
                 bias = init_gate(bias)
 
-    def set_state(self, prev_state, prev_attn):
+    def set_state(self, prev_state, prev_attn=None):
         ''' Setting up all memory states for beam decoding'''
         self.decoder.set_state(prev_state)
-        self.attention.set_mem(prev_attn)
+        if self.decoder.decoder_type == 'rnn':
+            self.attention.set_mem(prev_attn)
 
     def create_msg(self):
         # Messages for user
@@ -65,7 +69,7 @@ class ASR(nn.Module):
                 self.ctc_weight))
         if self.enable_att:
             msg.append('           | {} attention decoder enabled ( lambda = {}).'.format(
-                self.attention.mode, 1-self.ctc_weight))
+                self.attention.mode if self.attention is not None else "Transformer", 1-self.ctc_weight))
         return msg
 
     def forward(self, audio_feature, feature_len, decode_step, tf_rate=0.0, teacher=None,
@@ -76,7 +80,7 @@ class ASR(nn.Module):
             feature_len   - [B]     Length of each sample in a batch
             decode_step   - [int]   The maximum number of attention decoder steps 
             tf_rate       - [0,1]   The probability to perform teacher forcing for each step
-            teacher       - [BxLxD] Ground truth for teacher forcing with sentence length L
+            teacher       - [BxL] Ground truth for teacher forcing with sentence length L
             emb_decoder   - [obj]   Introduces the word embedding decoder, different behavior for training/inference
                                     At training stage, this ONLY affects self-sampling (output remains the same)
                                     At inference stage, this affects output to become log prob. with distribution fusion
@@ -97,59 +101,124 @@ class ASR(nn.Module):
         # Attention based decoding
         if self.enable_att:
             # Init (init char = <SOS>, reset all rnn state and cell)
-            self.decoder.init_state(bs)
-            self.attention.reset_mem()
-            last_char = self.pre_embed(torch.zeros(
-                (bs), dtype=torch.long, device=encode_feature.device))
-            att_seq, output_seq = [], []
+            if self.decoder.decoder_type == 'rnn':
+                self.decoder.init_state(bs)
+                self.attention.reset_mem()
+                last_char = self.pre_embed(torch.zeros(
+                    (bs), dtype=torch.long, device=encode_feature.device))
+                att_seq, output_seq = [], []
 
-            # Preprocess data for teacher forcing
-            if teacher is not None:
-                teacher = self.embed_drop(self.pre_embed(teacher))
+                # Preprocess data for teacher forcing
+                if teacher is not None:
+                    teacher = self.embed_drop(self.pre_embed(teacher))
 
-            # Decode
-            for t in range(decode_step):
-                # Attend (inputs current state of first layer, encoded features)
-                attn, context = self.attention(
-                    self.decoder.get_query(), encode_feature, encode_len)
-                # Decode (inputs context + embedded last character)
-                decoder_input = torch.cat([last_char, context], dim=-1)
-                cur_char, d_state = self.decoder(decoder_input)
-                # Prepare output as input of next step
-                if (teacher is not None):
+                # Decode
+                for t in range(decode_step):
+                    # Attend (inputs current state of first layer, encoded features)
+                    attn, context = self.attention(
+                        self.decoder.get_query(), encode_feature, encode_len)
+                    # Decode (inputs context + embedded last character)
+                    decoder_input = torch.cat([last_char, context], dim=-1)
+                    cur_char, d_state = self.decoder(decoder_input)
+                    # Prepare output as input of next step
+                    if (teacher is not None):
+                        # Training stage
+                        if (tf_rate == 1) or (torch.rand(1).item() <= tf_rate):
+                            # teacher forcing
+                            last_char = teacher[:, t, :]
+                        else:
+                            # self-sampling (replace by argmax may be another choice)
+                            with torch.no_grad():
+                                if (emb_decoder is not None) and emb_decoder.apply_fuse:
+                                    _, cur_prob = emb_decoder(
+                                        d_state, cur_char, return_loss=False)
+                                else:
+                                    cur_prob = cur_char.softmax(dim=-1)
+                                sampled_char = Categorical(cur_prob).sample()
+                            last_char = self.embed_drop(
+                                self.pre_embed(sampled_char))
+                    else:
+                        # Inference stage
+                        if (emb_decoder is not None) and emb_decoder.apply_fuse:
+                            _, cur_char = emb_decoder(
+                                d_state, cur_char, return_loss=False)
+                        # argmax for inference
+                        last_char = self.pre_embed(torch.argmax(cur_char, dim=-1))
+
+                    # save output of each step
+                    output_seq.append(cur_char)
+                    att_seq.append(attn)
+                    if get_dec_state:
+                        dec_state.append(d_state)
+
+                att_output = torch.stack(output_seq, dim=1)  # BxTxV
+                att_seq = torch.stack(att_seq, dim=2)       # BxNxDtxT
+                if get_dec_state:
+                    dec_state = torch.stack(dec_state, dim=1)
+
+            elif self.decoder.decoder_type == 'transformer':
+                self.decoder.init_state(bs) # reset decoder side pre-computed keys and values
+
+                att_seq, output_seq = [], []
+                
+
+                if teacher is not None:
                     # Training stage
                     if (tf_rate == 1) or (torch.rand(1).item() <= tf_rate):
-                        # teacher forcing
-                        last_char = teacher[:, t, :]
+                        # teacher forcing, speed up with parallel forward function.
+                        bos = torch.zeros(
+                            (bs, 1), dtype=torch.long, device=encode_feature.device)
+                        teacher = torch.cat([bos, teacher], dim=1)
+                        tgt_mask = make_std_mask(teacher, pad=0)
+                        teacher = self.embed_drop(self.pre_embed(teacher))
+                        all_cur_char, all_d_state = self.decoder.parallel_forward(teacher, encode_feature, encode_len, tgt_mask)
+                        if decode_step > all_cur_char.shape[1]:
+                            pad_vecs = torch.zeros(
+                                (all_cur_char.shape[0], decode_step - all_cur_char.shape[1], all_cur_char.shape[2]),
+                                dtype=all_cur_char.dtype,
+                                device=encode_feature.device
+                            )
+                            att_output = torch.cat([all_cur_char, pad_vecs], dim=1) # BxTxV
+                        else:
+                            att_output = all_cur_char[:,:decode_step,:]  # BxTxV
+                        att_seq = self.decoder.layers.decoder.layers[-1].src_attn.attn
+                        # teacher forcing ends
                     else:
-                        # self-sampling (replace by argmax may be another choice)
-                        with torch.no_grad():
-                            if (emb_decoder is not None) and emb_decoder.apply_fuse:
-                                _, cur_prob = emb_decoder(
-                                    d_state, cur_char, return_loss=False)
-                            else:
+                        # decode step by step
+                        last_char = self.pre_embed(torch.zeros(
+                            (bs), dtype=torch.long, device=encode_feature.device))
+                        
+                        for t in range(decode_step):
+                            decoder_input = last_char # transformer do not use external attention
+                            cur_char, d_state = self.decoder(decoder_input, encode_feature, encode_len) # emb_decoder is not support with transformer decoder, so d_state is not used for now.
+                            # sample a char for next input char.
+                            with torch.no_grad():
                                 cur_prob = cur_char.softmax(dim=-1)
-                            sampled_char = Categorical(cur_prob).sample()
-                        last_char = self.embed_drop(
-                            self.pre_embed(sampled_char))
+                                sampled_char = Categorical(cur_prob).sample()
+                            last_char = self.embed_drop(
+                                self.pre_embed(sampled_char))
+                            output_seq.append(cur_char)
+                            att_seq.append(self.decoder.layers.decoder.layers[-1].src_attn.attn)
+                        
+                        att_output = torch.stack(output_seq, dim=1)  # BxTxV
+                        att_seq = torch.cat(att_seq, dim=2)       # BxNxDtxT
+                        # decode w/o tf ends
                 else:
                     # Inference stage
-                    if (emb_decoder is not None) and emb_decoder.apply_fuse:
-                        _, cur_char = emb_decoder(
-                            d_state, cur_char, return_loss=False)
-                    # argmax for inference
-                    last_char = self.pre_embed(torch.argmax(cur_char, dim=-1))
+                    # decode step by step
+                    last_char = self.pre_embed(torch.zeros(
+                        (bs), dtype=torch.long, device=encode_feature.device))
+                    
+                    for t in range(decode_step):
+                        decoder_input = last_char # transformer do not use external attention
+                        cur_char, d_state = self.decoder(decoder_input, encode_feature, encode_len)
+                        last_char = self.pre_embed(torch.argmax(cur_char, dim=-1))
+                        # save output of each step
+                        output_seq.append(cur_char)
+                        att_seq.append(self.decoder.layers.decoder.layers[-1].src_attn.attn)
 
-                # save output of each step
-                output_seq.append(cur_char)
-                att_seq.append(attn)
-                if get_dec_state:
-                    dec_state.append(d_state)
-
-            att_output = torch.stack(output_seq, dim=1)  # BxTxV
-            att_seq = torch.stack(att_seq, dim=2)       # BxNxDtxT
-            if get_dec_state:
-                dec_state = torch.stack(dec_state, dim=1)
+                    att_output = torch.stack(output_seq, dim=1)  # BxTxV
+                    att_seq = torch.cat(att_seq, dim=2)       # BxNxDtxT
 
         return ctc_output, encode_len, att_output, att_seq, dec_state
 
@@ -166,15 +235,26 @@ class Decoder(nn.Module):
         self.dropout = dropout
 
         # Init
-        assert module in ['LSTM', 'GRU'], NotImplementedError
-        self.hidden_state = None
-        self.enable_cell = module == 'LSTM'
+        if module in ['LSTM', 'GRU']:
+            self.hidden_state = None
+            self.enable_cell = module == 'LSTM'
+            self.decoder_type = 'rnn'
 
-        # Modules
-        self.layers = getattr(nn, module)(
-            input_dim, dim, num_layers=layer, dropout=dropout, batch_first=True)
-        self.char_trans = nn.Linear(dim, vocab_size)
-        self.final_dropout = nn.Dropout(dropout)
+            # Modules
+            self.layers = getattr(nn, module)(
+                input_dim, dim, num_layers=layer, dropout=dropout, batch_first=True)
+            self.char_trans = nn.Linear(dim, vocab_size)
+            self.final_dropout = nn.Dropout(dropout)
+        elif module in ['Transformer', 'transformer', 'trans']:
+            self.hidden_state = None
+            self.enable_cell = False
+            self.decoder_type = 'transformer'
+            self.pre_shrink = nn.Linear(input_dim, dim)
+            self.layers = SpeechTransformerDecoder(N=layer, d_model=dim, d_ff=dim*2, h=16, dropout=dropout)
+            self.char_trans = nn.Linear(dim, vocab_size)
+            self.final_dropout = nn.Dropout(dropout)
+        else:
+            raise NotImplementedError
 
     def init_state(self, bs):
         ''' Set all hidden states to zeros '''
@@ -183,25 +263,30 @@ class Decoder(nn.Module):
             self.hidden_state = (torch.zeros((self.layer, bs, self.dim), device=device),
                                  torch.zeros((self.layer, bs, self.dim), device=device))
         else:
-            self.hidden_state = torch.zeros(
-                (self.layer, bs, self.dim), device=device)
+            if self.decoder_type == 'rnn':
+                self.hidden_state = torch.zeros(
+                    (self.layer, bs, self.dim), device=device)
+            else: # In transformer model, hidden_state means decoder part pre-computed keys and values.
+                self.hidden_state = None
         return self.get_state()
 
     def set_state(self, hidden_state):
         ''' Set all hidden states/cells, for decoding purpose'''
+        ''' Transformer do not need this function'''
         device = next(self.parameters()).device
         if self.enable_cell:
             self.hidden_state = (hidden_state[0].to(
                 device), hidden_state[1].to(device))
         else:
             self.hidden_state = hidden_state.to(device)
-
+            
     def get_state(self):
         ''' Return all hidden states/cells, for decoding purpose'''
+        ''' Transformer do not need this function'''
         if self.enable_cell:
             return (self.hidden_state[0].cpu(), self.hidden_state[1].cpu())
         else:
-            return self.hidden_state.cpu()
+            return self.hidden_state.cpu() if self.hidden_state is not None else None
 
     def get_query(self):
         ''' Return state of all layers as query for attention '''
@@ -210,14 +295,28 @@ class Decoder(nn.Module):
         else:
             return self.hidden_state.transpose(0, 1).reshape(-1, self.dim*self.layer)
 
-    def forward(self, x):
-        ''' Decode and transform into vocab '''
-        if not self.training:
-            self.layers.flatten_parameters()
-        x, self.hidden_state = self.layers(x.unsqueeze(1), self.hidden_state)
+    def forward(self, x, src_memory=None, src_lens=None):
+        ''' Decode and transform into vocab 
+            src_memory, src_lens are for transformer
+        '''
+        if self.decoder_type == 'rnn':
+            if not self.training:
+                self.layers.flatten_parameters()
+            x, self.hidden_state = self.layers(x.unsqueeze(1), self.hidden_state)
+        else: # Transformer
+            assert src_lens is not None and src_memory is not None
+            x, self.hidden_state = self.layers(memory=src_memory, src_lens=src_lens, tgt=x.unsqueeze(1), tgt_mask=None, past=self.hidden_state)
+
         x = x.squeeze(1)
         char = self.char_trans(self.final_dropout(x))
         return char, x
+
+    def parallel_forward(self, x, memory, src_lens, tgt_mask):
+        assert self.decoder_type == 'transformer', "Parallel forward function not supported for RNN decoder."
+        x, self.hidden_state = self.layers(memory, src_lens, x, tgt_mask, past=None)
+        char = self.char_trans(self.final_dropout(x))
+        return char, x
+
 
 
 class Attention(nn.Module):
@@ -337,29 +436,47 @@ class Encoder(nn.Module):
             vgg_extractor = VGGExtractor(input_size)
             module_list.append(vgg_extractor)
             input_dim = vgg_extractor.out_dim
-            self.sample_rate = self.sample_rate*4
+            self.sample_rate = self.sample_rate * 4
         if self.cnn:
             cnn_extractor = CNNExtractor(input_size, out_dim=dim[0])
             module_list.append(cnn_extractor)
             input_dim = cnn_extractor.out_dim
             self.sample_rate = self.sample_rate*4
 
-        # Recurrent encoder
         if module in ['LSTM', 'GRU']:
+            # Recurrent encoder
+            self.encoder_type = 'rnn'
             for l in range(num_layers):
                 module_list.append(RNNLayer(input_dim, module, dim[l], bidirection, dropout[l], layer_norm[l],
                                             sample_rate[l], sample_style, proj[l]))
                 input_dim = module_list[-1].out_dim
-                self.sample_rate = self.sample_rate*sample_rate[l]
+                self.sample_rate = self.sample_rate * sample_rate[l]
+                
+                # Build model
+                self.in_dim = input_size
+                self.out_dim = input_dim
+        elif module in ['Transformer', 'transformer', 'trans']:
+            # Transformer encoder
+            self.encoder_type = 'transformer'
+            # Downsampling is not support by transformer; `sample_rate` is ignored.
+            module_list.append(nn.Linear(input_dim, dim[0])) # Transformer is fixed size among layers, so we shrink the input size first with nn.Linear.
+            input_dim = dim[0]
+            module_list.append(SpeechTransformerEncoder(N=num_layers, d_model=input_dim, d_ff=input_dim*2, h=16, dropout=dropout[0]))
+            self.in_dim = input_size
+            self.out_dim = input_dim
         else:
             raise NotImplementedError
-
-        # Build model
-        self.in_dim = input_size
-        self.out_dim = input_dim
         self.layers = nn.ModuleList(module_list)
 
+
     def forward(self, input_x, enc_len):
-        for _, layer in enumerate(self.layers):
-            input_x, enc_len = layer(input_x, enc_len)
+        if self.encoder_type == 'rnn':
+            for _, layer in enumerate(self.layers):
+                input_x, enc_len = layer(input_x, enc_len)
+        elif self.encoder_type == 'transformer':
+            input_x, enc_len = self.layers[0](input_x, enc_len)
+            input_x = self.layers[1](input_x)
+            input_x, enc_len = self.layers[2](input_x, enc_len)
+        else:
+            raise NotImplementedError
         return input_x, enc_len
