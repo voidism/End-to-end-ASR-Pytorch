@@ -5,43 +5,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class EncoderDecoder(nn.Module):
-    """
-    A standard Encoder-Decoder architecture. Base for this and many 
-    other models.
-    """
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
-        super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed # Embedding function
-        self.tgt_embed = tgt_embed  # Embedding function
-        self.generator = generator
+# class EncoderDecoder(nn.Module):
+#     """
+#     A standard Encoder-Decoder architecture. Base for this and many 
+#     other models.
+#     """
+#     def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+#         super(EncoderDecoder, self).__init__()
+#         self.encoder = encoder
+#         self.decoder = decoder
+#         self.src_embed = src_embed # Embedding function
+#         self.tgt_embed = tgt_embed  # Embedding function
+#         self.generator = generator
         
-    def forward(self, src, tgt, src_mask, tgt_mask):
-        "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask,
-                            tgt, tgt_mask)
+#     def forward(self, src, tgt, src_mask, tgt_mask):
+#         "Take in and process masked src and target sequences."
+#         return self.decode(self.encode(src, src_mask), src_mask,
+#                             tgt, tgt_mask)
     
-    def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+#     def encode(self, src, src_mask):
+#         return self.encoder(self.src_embed(src), src_mask)
     
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+#     def decode(self, memory, src_mask, tgt, tgt_mask):
+#         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
 
 
-class Generator(nn.Module):
-    "Define standard linear + softmax generation step."
-    def __init__(self, d_model, vocab):
-        super(Generator, self).__init__()
-        self.proj = nn.Linear(d_model, vocab)
-        self.softmax = nn.Softmax(dim=-1)
+# class Generator(nn.Module):
+#     "Define standard linear + softmax generation step."
+#     def __init__(self, d_model, vocab):
+#         super(Generator, self).__init__()
+#         self.proj = nn.Linear(d_model, vocab)
+#         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x):
-        return F.log_softmax(self.proj(x), dim=-1)
+#     def forward(self, x):
+#         return F.log_softmax(self.proj(x), dim=-1)
         
-    def scaled_forward(self, x, scale=1.0):
-        return self.softmax(self.proj(x)*scale)
+#     def scaled_forward(self, x, scale=1.0):
+#         return self.softmax(self.proj(x)*scale)
 
 def clones(module, N):
     "Produce N identical layers."
@@ -158,7 +158,12 @@ class TransformerDecoder(nn.Module):
         
     def forward(self, memory, src_lens, tgt, tgt_mask, past=None):
         src_mask = make_mask_from_lens(memory, src_lens)
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask, past)
+        past_len = 0
+        if past is not None:
+            if past[0] is not None:
+                if past[0][0] is not None:
+                    past_len = past[0][0].shape[-2]
+        return self.decoder(self.tgt_embed(tgt, past_len=past_len), memory, src_mask, tgt_mask, past)
 
 
 class DecoderLayer(nn.Module):
@@ -294,29 +299,43 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
         
-    def forward(self, x):
-        x = x.float() + self.pe[:, :x.size(1)]
+    def forward(self, x, past_len=0):
+        x = x.float() + self.pe[:, past_len:past_len+x.size(1)]
         return self.dropout(x)
 
-def Transformer(N=6, d_model=1024, d_ff=2048, h=8, dropout=0.1):
-    "Helper: Construct a model from hyperparameters."
-    c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
-    model = EncoderDecoder(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-        Decoder(DecoderLayer(d_model, c(attn), c(attn), 
-                             c(ff), dropout), N),
-        nn.Sequential(Scale(d_model), c(position)),
-        nn.Sequential(Scale(d_model), c(position)), None)
+# def Transformer(N=6, d_model=1024, d_ff=2048, h=8, dropout=0.1):
+#     "Helper: Construct a model from hyperparameters."
+#     c = copy.deepcopy
+#     attn = MultiHeadedAttention(h, d_model)
+#     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+#     position = PositionalEncoding(d_model, dropout)
+#     model = EncoderDecoder(
+#         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+#         Decoder(DecoderLayer(d_model, c(attn), c(attn), 
+#                              c(ff), dropout), N),
+#         ScalePositionEmbedding(Scale(d_model), c(position)),
+#         ScalePositionEmbedding(Scale(d_model), c(position)), None)
     
-    # This was important from their code. 
-    # Initialize parameters with Glorot / fan_avg.
-    for p in model.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
-    return model
+#     # This was important from their code. 
+#     # Initialize parameters with Glorot / fan_avg.
+#     for p in model.parameters():
+#         if p.dim() > 1:
+#             nn.init.xavier_uniform_(p)
+#     return model
+
+class ScalePositionEmbedding(nn.Module):
+    def __init__(self, scale, position):
+        super(ScalePositionEmbedding, self).__init__()
+        self.add_module('0', scale)
+        self.add_module('1', position)
+
+    def __getitem__(self, idx):
+        return self._modules[str(idx)]
+
+    def forward(self, x, past_len=0):
+        x = self[0](x)
+        x = self[1](x, past_len)
+        return x
 
 def SpeechTransformerEncoder(N=6, d_model=1024, d_ff=2048, h=8, dropout=0.1):
     '''Helper: Construct a model from hyperparameters. 
@@ -328,7 +347,7 @@ def SpeechTransformerEncoder(N=6, d_model=1024, d_ff=2048, h=8, dropout=0.1):
     position = PositionalEncoding(d_model, dropout)
     model = TransformerEncoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-        nn.Sequential(Scale(d_model), c(position)))
+        ScalePositionEmbedding(Scale(d_model), c(position)))
     
     # This was important from their code. 
     # Initialize parameters with Glorot / fan_avg.
@@ -347,7 +366,7 @@ def SpeechTransformerDecoder(N=6, d_model=1024, d_ff=2048, h=8, dropout=0.1):
     position = PositionalEncoding(d_model, dropout)
     model = TransformerDecoder(
         Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
-        nn.Sequential(Scale(d_model), c(position)))
+        ScalePositionEmbedding(Scale(d_model), c(position)))
     
     # This was important from their code. 
     # Initialize parameters with Glorot / fan_avg.
